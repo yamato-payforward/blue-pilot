@@ -38,7 +38,7 @@ BluePilot の背骨となる繰り返しです。各ステップで必ずデー�
 
 | エンティティ | 役割 | ひとことで言うと |
 |---|---|---|
-| `symbols` | 銘柄マスタ | 何を対象にするか（例: binance BTC/USDT） |
+| `instruments` | 銘柄マスタ | 何を対象にするか（例: binance BTC/USDT） |
 | `candles` | 生の OHLCV | **唯一の真実**。ここから全部導ける |
 | `market_snapshots` | 判断時に AI が見た指標一式 | **証拠**。後から書き換わってはいけない |
 | `signals` | AI の判断 | Buy / Sell / No Action ＋ 理由 |
@@ -51,13 +51,13 @@ BluePilot の背骨となる繰り返しです。各ステップで必ずデー�
 
 ```mermaid
 erDiagram
-    symbols ||--o{ candles : "価格履歴を持つ"
-    symbols ||--o{ market_snapshots : "スナップショットを持つ"
+    instruments ||--o{ candles : "価格履歴を持つ"
+    instruments ||--o{ market_snapshots : "スナップショットを持つ"
     market_snapshots ||--o{ signals : "判断を生む（Analyzer ごとに1件）"
     analyzer_versions ||--o{ signals : "が判断した"
     signals ||--o| outcomes : "の成績"
 
-    symbols {
+    instruments {
         bigint id PK
         string exchange
         string base
@@ -66,7 +66,7 @@ erDiagram
     }
     candles {
         bigint id PK
-        bigint symbol_id FK
+        bigint instrument_id FK
         string timeframe
         datetime open_time
         decimal open
@@ -81,7 +81,7 @@ erDiagram
     }
     market_snapshots {
         bigint id PK
-        bigint symbol_id FK
+        bigint instrument_id FK
         string timeframe
         datetime captured_at
         jsonb features
@@ -126,7 +126,7 @@ erDiagram
 
 ## 4. エンティティ詳細
 
-### 4.1 `symbols` — 銘柄
+### 4.1 `instruments` — 銘柄
 
 | カラム | 型 | 説明 |
 |---|---|---|
@@ -134,9 +134,15 @@ erDiagram
 | `base` / `quote` | string | `BTC` / `USDT` |
 | `active` | boolean | 収集対象か |
 
-制約: `unique(exchange, base, quote)`
+| `market_type` | string | `perpetual` / `spot` |
 
-初期は **binance BTC/USDT の1銘柄**から。銘柄を増やすとサンプルが増え、検証が速くなる。
+制約: `unique(exchange, base, quote, market_type)`
+
+初期は **binance BTCUSDT（perpetual）の1銘柄**から。銘柄を増やすとサンプルが増え、検証が速くなる。
+
+テーブル名を `symbols` にしていないのは、Rails のモデル名が `Symbol` となり
+**Ruby 組み込みの `Symbol` クラスと衝突する**ため。`instrument` は金融分野で
+「取引される商品」を指す一般的な語で、現物と先物の両方を含められる。
 
 ---
 
@@ -153,7 +159,7 @@ erDiagram
 | `taker_buy_base_volume` | decimal | 成行買いの出来高 |
 | `taker_buy_quote_volume` | decimal | 成行買いの出来高（金額ベース） |
 
-制約: `unique(symbol_id, timeframe, open_time)`
+制約: `unique(instrument_id, timeframe, open_time)`
 
 - **価格は必ず `decimal`**。`float` は誤差が出るため金額に使わない
 - unique 制約により、**同じ足を何度取得しても壊れない**（冪等）
@@ -176,7 +182,7 @@ erDiagram
 | `captured_at` | datetime | 判断時刻（＝使った足の確定時刻） |
 | `features` | jsonb | 指標一式 |
 
-制約: `unique(symbol_id, timeframe, captured_at)`
+制約: `unique(instrument_id, timeframe, captured_at)`
 
 `features` の例:
 
@@ -603,8 +609,19 @@ Binance の先物データ系エンドポイントは**直近30日程度しか�
 |---|---|---|---|
 | OHLCV + 拡張4カラム | `/fapi/v1/klines` | ✅ 2017年〜 | 1h |
 | Funding Rate | `/fapi/v1/fundingRate` | ✅ 契約開始〜 | 8時間 |
-| Mark / Index Price | `/fapi/v1/premiumIndex` | △ | ベーシス算出用 |
+| Mark / Index Price（ベーシス） | `/fapi/v1/markPriceKlines`<br>`/fapi/v1/indexPriceKlines` | ✅ ローソク足形式で遡れる | 1h |
 | Fear & Greed Index | `api.alternative.me/fng/` | ✅ 2018年〜 | 日次 |
+
+**ベーシス**（先物価格と現物指数価格の乖離）は Funding Rate と近い情報を持つが、
+Funding が8時間ごとにしか発生しないのに対し、ベーシスは**連続的に観測できる**ため
+より細かい変化を捉えられる。
+
+```
+basis_pct = (mark_price - index_price) / index_price
+
+プラスが大きい → 先物が現物より高い → 強気に傾いている（過熱）
+マイナス       → 先物が現物より安い → 弱気
+```
 
 #### 🟢 保存しない — OHLCV から計算できる
 
@@ -626,9 +643,10 @@ RSI / MACD / 移動平均 / ボリンジャーバンド / ATR / ボラティリ�
 | candles (1h) | 毎時 | 8,760 |
 | Funding Rate | 8時間 | 1,095 |
 | Open Interest | 毎時 | 8,760 |
-| L/S Ratio × 3種 | 毎時 | 26,280 |
+| L/S Ratio × 4種 | 毎時 | 35,040 |
+| ベーシス（mark/index） | 毎時 | 8,760 |
 | Fear & Greed | 日次 | 365 |
-| **合計** | | **約 45,000 行/年** |
+| **合計** | | **約 62,000 行/年** |
 
 10年蓄積しても約45万行であり、PostgreSQL にとって負荷にならない。
 
@@ -679,7 +697,51 @@ take_profit = entry + 3 × ATR(14)     （リスクリワード 1 : 1.5）
 
 ---
 
-## 8. 検証サイクルの見通し
+## 8. 空売り（ショート）の扱い
+
+先物を対象とするため（→ §6.1）、`sell` は正規の判断肢とする。vision.md の
+`Buy / Sell / No Action` に対応する。
+
+利点:
+
+- **機会がおよそ2倍**になり、シグナルが貯まる速度＝検証サイクルが速くなる
+- 仮想通貨は下落局面が数ヶ月〜1年続くことがあり、ロングのみだと動けない期間が生じる
+- 学習データとして上昇・下落の両パターンを含められる
+
+### 8.1 成績は long / short を分けて集計する
+
+```
+❌ 全体の勝率 55%
+✅ long 70% / short 40%  ← 分けて初めて「ショートが足を引っ張っている」と分かる
+```
+
+`signals.action` で分離できるが、**混ぜて評価してはいけない**。方向ごとに
+有効な特徴量が異なる可能性があるため、改善の手がかりを失う。
+
+### 8.2 仮想通貨には長期的な上昇バイアスがある
+
+2017年以降、BTC は長期的に大きく上昇してきた。この期間はロングが構造的に有利であり、
+ショートは逆風だった。保有期間が3〜5日であれば日々のボラティリティに比べて
+長期トレンドの影響は小さいが、**成績を解釈する際は考慮する**。
+
+### 8.3 バイ・アンド・ホールドをベンチマークとして記録する
+
+上昇バイアスがあるため、**勝率が高いだけでは戦略に価値があるとは言えない**。
+
+```
+AI戦略の年間リターン      : +30%
+同期間の BTC 保有のみ     : +80%
+→ 「勝っている」ように見えて、何もしない方が良かった
+```
+
+`outcomes` の集計とあわせて、**同期間のバイ・アンド・ホールド収益を必ず併記する**。
+これを超えられない限り、戦略として採用しない。
+
+vision.md の「感覚ではなくデータで判断する」を、戦略の採否そのものに適用する。
+
+---
+
+## 9. 検証サイクルの見通し
 
 期待値を明示しておく。
 
@@ -693,7 +755,7 @@ take_profit = entry + 3 × ATR(14)     （リスクリワード 1 : 1.5）
 
 ---
 
-## 9. 用語集
+## 10. 用語集
 
 | 用語 | 意味 |
 |---|---|
@@ -708,7 +770,7 @@ take_profit = entry + 3 × ATR(14)     （リスクリワード 1 : 1.5）
 
 ---
 
-## 10. このドキュメントの扱い
+## 11. このドキュメントの扱い
 
 - 実装より先にここを更新し、合意してから書く
 - 設計判断を変えるときは §5 に**理由ごと**追記する（決定の履歴を残す）
