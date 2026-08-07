@@ -1,24 +1,69 @@
-# README
+# BluePilot
 
-This README would normally document whatever steps are necessary to get the
-application up and running.
+BluePilotは、AIを活用して相場分析・学習・改善を繰り返しながら、継続的に精度を高めていく投資支援プラットフォームです。
 
-Things you may want to cover:
+本プロジェクトの目的は、「AIに投資を丸投げすること」ではありません。
 
-* Ruby version
+AIが出した予測結果を継続的に検証・分析し、その結果をAIへフィードバックすることで、少しずつ期待値の高いモデルへ改善していくことを目指します。
 
-* System dependencies
+---
 
-* Configuration
+## コンセプト
 
-* Database creation
+BluePilotでは、以下の改善サイクルを繰り返します。
 
-* Database initialization
+```
+市場データ取得
+        ↓
+AI分析
+        ↓
+アラート生成
+        ↓
+結果を記録
+        ↓
+AIへフィードバック
+        ↓
+次回の分析へ反映
+```
 
-* How to run the test suite
+固定されたルールで売買するのではなく、市場環境の変化に合わせて継続的に改善できるシステムを目指しています。
 
-* Services (job queues, cache servers, search engines, etc.)
+---
 
-* Deployment instructions
+## 主な機能
 
-* ...
+* AIによる売買アラート生成
+* テクニカル分析
+* ファンダメンタル分析
+* アラート履歴管理
+* 勝敗・成績管理
+* AIへのフィードバック
+* （将来的に）自動売買
+
+---
+
+## 技術スタック（予定）
+
+* Ruby on Rails
+* PostgreSQL
+* Docker
+* GitHub Actions
+* Devise
+* 仮想通貨API
+* AI API
+
+---
+
+## 開発方針
+
+まずは小さく動くものを作ります。
+
+優先順位は以下です。
+
+1. 市場データを取得する
+2. AIがアラートを出す
+3. アラート結果を記録する
+4. AIへフィードバックする
+5. 改善を繰り返す
+
+最初から完璧なAIを目指すのではなく、「改善し続けられる仕組み」を作ることを最優先としています。
