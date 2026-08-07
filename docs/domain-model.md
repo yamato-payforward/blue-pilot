@@ -38,7 +38,7 @@ BluePilot の背骨となる繰り返しです。各ステップで必ずデー�
 
 | エンティティ | 役割 | ひとことで言うと |
 |---|---|---|
-| `symbols` | 銘柄マスタ | 何を対象にするか（例: binance BTC/USDT） |
+| `instruments` | 銘柄マスタ | 何を対象にするか（例: binance BTC/USDT） |
 | `candles` | 生の OHLCV | **唯一の真実**。ここから全部導ける |
 | `market_snapshots` | 判断時に AI が見た指標一式 | **証拠**。後から書き換わってはいけない |
 | `signals` | AI の判断 | Buy / Sell / No Action ＋ 理由 |
@@ -51,13 +51,13 @@ BluePilot の背骨となる繰り返しです。各ステップで必ずデー�
 
 ```mermaid
 erDiagram
-    symbols ||--o{ candles : "価格履歴を持つ"
-    symbols ||--o{ market_snapshots : "スナップショットを持つ"
+    instruments ||--o{ candles : "価格履歴を持つ"
+    instruments ||--o{ market_snapshots : "スナップショットを持つ"
     market_snapshots ||--o{ signals : "判断を生む（Analyzer ごとに1件）"
     analyzer_versions ||--o{ signals : "が判断した"
     signals ||--o| outcomes : "の成績"
 
-    symbols {
+    instruments {
         bigint id PK
         string exchange
         string base
@@ -66,7 +66,7 @@ erDiagram
     }
     candles {
         bigint id PK
-        bigint symbol_id FK
+        bigint instrument_id FK
         string timeframe
         datetime open_time
         decimal open
@@ -81,7 +81,7 @@ erDiagram
     }
     market_snapshots {
         bigint id PK
-        bigint symbol_id FK
+        bigint instrument_id FK
         string timeframe
         datetime captured_at
         jsonb features
@@ -126,7 +126,7 @@ erDiagram
 
 ## 4. エンティティ詳細
 
-### 4.1 `symbols` — 銘柄
+### 4.1 `instruments` — 銘柄
 
 | カラム | 型 | 説明 |
 |---|---|---|
@@ -134,9 +134,15 @@ erDiagram
 | `base` / `quote` | string | `BTC` / `USDT` |
 | `active` | boolean | 収集対象か |
 
-制約: `unique(exchange, base, quote)`
+| `market_type` | string | `perpetual` / `spot` |
 
-初期は **binance BTC/USDT の1銘柄**から。銘柄を増やすとサンプルが増え、検証が速くなる。
+制約: `unique(exchange, base, quote, market_type)`
+
+初期は **binance BTCUSDT（perpetual）の1銘柄**から。銘柄を増やすとサンプルが増え、検証が速くなる。
+
+テーブル名を `symbols` にしていないのは、Rails のモデル名が `Symbol` となり
+**Ruby 組み込みの `Symbol` クラスと衝突する**ため。`instrument` は金融分野で
+「取引される商品」を指す一般的な語で、現物と先物の両方を含められる。
 
 ---
 
@@ -153,7 +159,7 @@ erDiagram
 | `taker_buy_base_volume` | decimal | 成行買いの出来高 |
 | `taker_buy_quote_volume` | decimal | 成行買いの出来高（金額ベース） |
 
-制約: `unique(symbol_id, timeframe, open_time)`
+制約: `unique(instrument_id, timeframe, open_time)`
 
 - **価格は必ず `decimal`**。`float` は誤差が出るため金額に使わない
 - unique 制約により、**同じ足を何度取得しても壊れない**（冪等）
@@ -176,7 +182,7 @@ erDiagram
 | `captured_at` | datetime | 判断時刻（＝使った足の確定時刻） |
 | `features` | jsonb | 指標一式 |
 
-制約: `unique(symbol_id, timeframe, captured_at)`
+制約: `unique(instrument_id, timeframe, captured_at)`
 
 `features` の例:
 
