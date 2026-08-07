@@ -67,6 +67,27 @@ class MarketDataTest < ActiveSupport::TestCase
     assert_not record.valid?
   end
 
+  # 収集ジョブは insert_all を使うためバリデーションを経由しない。
+  # DB 側の制約が最後の砦になる。
+  test "long short ratio rejects an unknown type even when validations are bypassed" do
+    assert_raises(ActiveRecord::StatementInvalid) do
+      LongShortRatio.insert_all([ {
+        instrument_id: @instrument.id, ratio_type: "whales", recorded_at: @time,
+        long_value: 0.65, short_value: 0.35, ratio: 1.857,
+        created_at: Time.current, updated_at: Time.current
+      } ])
+    end
+  end
+
+  test "instrument rejects an unknown market type even when validations are bypassed" do
+    assert_raises(ActiveRecord::StatementInvalid) do
+      Instrument.insert_all([ {
+        exchange: "binance", base: "ETH", quote: "USDT", market_type: "futures",
+        created_at: Time.current, updated_at: Time.current
+      } ])
+    end
+  end
+
   test "premium index computes basis from mark and index price" do
     basis = PremiumIndex.basis_pct_for(mark_price: BigDecimal("101000"), index_price: BigDecimal("100000"))
 
@@ -75,6 +96,12 @@ class MarketDataTest < ActiveSupport::TestCase
 
   test "premium index basis is nil without an index price" do
     assert_nil PremiumIndex.basis_pct_for(mark_price: BigDecimal("101000"), index_price: BigDecimal("0"))
+    assert_nil PremiumIndex.basis_pct_for(mark_price: BigDecimal("101000"), index_price: nil)
+  end
+
+  # 外部 API のレスポンスが欠損していても収集ジョブを落とさない
+  test "premium index basis is nil without a mark price" do
+    assert_nil PremiumIndex.basis_pct_for(mark_price: nil, index_price: BigDecimal("100000"))
   end
 
   test "premium index rejects a duplicate at the same time" do

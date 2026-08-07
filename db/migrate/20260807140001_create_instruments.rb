@@ -18,5 +18,11 @@ class CreateInstruments < ActiveRecord::Migration[8.1]
               %i[exchange base quote market_type],
               unique: true,
               name: "index_instruments_on_exchange_and_pair"
+
+    # 収集ジョブは insert_all / upsert_all を使うためモデルのバリデーションを
+    # 経由しない。想定外の値が入らないよう DB 側でも制約する。
+    add_check_constraint :instruments,
+                         "market_type IN ('perpetual', 'spot')",
+                         name: "instruments_market_type_check"
   end
 end

@@ -10,7 +10,8 @@
 class CreateOpenInterests < ActiveRecord::Migration[8.1]
   def change
     create_table :open_interests do |t|
-      t.references :instrument, null: false, foreign_key: true
+      # 複合ユニークインデックスの先頭が instrument_id なので単体 index は作らない
+      t.references :instrument, null: false, foreign_key: true, index: false
       t.datetime :recorded_at, null: false
       t.decimal :open_interest, precision: 30, scale: 8, null: false       # 契約数
       t.decimal :open_interest_value, precision: 30, scale: 8              # 金額換算

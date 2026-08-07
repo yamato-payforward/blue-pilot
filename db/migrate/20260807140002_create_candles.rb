@@ -7,7 +7,8 @@
 class CreateCandles < ActiveRecord::Migration[8.1]
   def change
     create_table :candles do |t|
-      t.references :instrument, null: false, foreign_key: true
+      # 複合ユニークインデックスの先頭が instrument_id なので単体 index は作らない
+      t.references :instrument, null: false, foreign_key: true, index: false
       t.string :timeframe, null: false   # "1h"
       t.datetime :open_time, null: false # 足の開始時刻（UTC）
 

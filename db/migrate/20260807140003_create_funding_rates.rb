@@ -8,7 +8,8 @@
 class CreateFundingRates < ActiveRecord::Migration[8.1]
   def change
     create_table :funding_rates do |t|
-      t.references :instrument, null: false, foreign_key: true
+      # 複合ユニークインデックスの先頭が instrument_id なので単体 index は作らない
+      t.references :instrument, null: false, foreign_key: true, index: false
       t.datetime :funding_time, null: false
       t.decimal :funding_rate, precision: 20, scale: 10, null: false
 

@@ -10,7 +10,8 @@
 class CreatePremiumIndices < ActiveRecord::Migration[8.1]
   def change
     create_table :premium_indices do |t|
-      t.references :instrument, null: false, foreign_key: true
+      # 複合ユニークインデックスの先頭が instrument_id なので単体 index は作らない
+      t.references :instrument, null: false, foreign_key: true, index: false
       t.datetime :recorded_at, null: false
       t.decimal :mark_price, precision: 20, scale: 8, null: false
       t.decimal :index_price, precision: 20, scale: 8, null: false
