@@ -74,6 +74,10 @@ erDiagram
         decimal low
         decimal close
         decimal volume
+        decimal quote_volume
+        integer trades_count
+        decimal taker_buy_base_volume
+        decimal taker_buy_quote_volume
     }
     market_snapshots {
         bigint id PK
@@ -143,13 +147,24 @@ erDiagram
 | `timeframe` | string | `1h`（保存はこれ。4h は合成する → §5.2） |
 | `open_time` | datetime | 足の開始時刻（**UTC**） |
 | `open` / `high` / `low` / `close` | decimal | 価格 |
-| `volume` | decimal | 出来高 |
+| `volume` | decimal | 出来高（base 資産ベース） |
+| `quote_volume` | decimal | 出来高（金額ベース） |
+| `trades_count` | integer | 約定回数 |
+| `taker_buy_base_volume` | decimal | 成行買いの出来高 |
+| `taker_buy_quote_volume` | decimal | 成行買いの出来高（金額ベース） |
 
 制約: `unique(symbol_id, timeframe, open_time)`
 
 - **価格は必ず `decimal`**。`float` は誤差が出るため金額に使わない
 - unique 制約により、**同じ足を何度取得しても壊れない**（冪等）
 - **確定した足のみ保存する**（→ §5.4）
+
+後半4カラムは Binance の kline レスポンスに**最初から含まれている**。追加の API コールは
+不要で、保存しなければ捨てているだけになる。特に有用なのは:
+
+- `volume ÷ trades_count` = **平均取引サイズ**。大口が動いているか小口かの判別に使える
+- `taker_buy_base_volume` と `volume` の比 = **成行の買い圧力か売り圧力か**。
+  通常の出来高は売買の総量なので、どちら側が積極的に叩いているかは分からない
 
 ---
 
@@ -214,6 +229,7 @@ erDiagram
 | カラム | 型 | 説明 |
 |---|---|---|
 | `evaluation_mode` | string | `actual`（buy/sell）/ `counterfactual`（no_action）→ §5.8 |
+| `hypothetical_action` | string | counterfactual 時のみ `buy` / `sell`。actual では NULL |
 | `result` | string | `win` / `loss` / `draw` |
 | `exit_reason` | string | `take_profit` / `stop_loss` / `timeout` |
 | `exit_price` / `exit_at` | decimal / datetime | 決済価格・時刻 |
@@ -223,7 +239,10 @@ erDiagram
 | `holding_hours` | float | 保有時間 |
 | `ambiguous` | boolean | 同一足内で tp/sl 両方に到達し、順序が判別できなかった（→ §5.9） |
 
-制約: `unique(signal_id)`（1シグナルにつき1成績）
+制約: `unique(signal_id, hypothetical_action)`
+
+buy / sell のシグナルは `hypothetical_action` が NULL なので実質 1 シグナル 1 成績。
+`no_action` のみ buy 想定・sell 想定の 2 件を持つ（→ §5.8）。
 
 MFE / MAE を持つ理由: 勝敗だけでは「際どく勝った」「大きく含み損を抱えた末に勝った」が区別できない。**リスク管理を優先する**という理念には、この情報が要る。
 
@@ -247,14 +266,18 @@ MFE / MAE を持つ理由: 勝敗だけでは「際どく勝った」「大き�
 
 後から「なぜこうしたか」を失わないための記録です。
 
-### 5.1 なぜ OHLCV だけ保存し、指標は保存しないのか
+### 5.1 なぜ指標を保存しないのか
 
-指標（RSI/MACD/MA/BB/ATR/ボラ）は **すべて OHLCV から計算できる導出データ**です。
+**この原則が適用されるのは「指標」だけ**である。OHLCV から計算できないデータ
+（Funding Rate / Open Interest など → §6.5）は、取得して保存しなければ二度と手に入らない。
+
+指標（RSI/MACD/MA/BB/ATR/ボラ）は **すべて OHLCV から計算できる導出データ**である。
 
 | データ | 性質 | 保存 |
 |---|---|---|
 | OHLCV | 取引所から取得する事実。計算不可能 | ✅ する |
 | 各種指標 | OHLCV から決定論的に計算できる | ❌ しない（都度計算） |
+| Funding / OI / L-S Ratio | **市場の内部状態。価格からは導出不可能** | ✅ する（→ §6.5） |
 
 4h足5年で約11,000本、1h足8年でも約70,000本。**全期間の指標を再計算しても1秒かからない**規模なので、保存して同期を気にする方がコストが高い。
 
@@ -353,9 +376,27 @@ vision の基本理念そのもの。
 `no_action` には実際の tp/sl が存在しないため、そのままでは §4.5 の評価軸に乗らない。
 そこで **反実仮想（counterfactual）** で評価する。
 
-1. `no_action` のシグナルにも、**仮に buy していたら**の `entry_price` / `take_profit` / `stop_loss` を記録しておく
+1. `no_action` のシグナルにも、**仮に入っていたら**の `entry_price` / `take_profit` / `stop_loss` を記録しておく
 2. 評価時は、buy/sell と**まったく同じロジック**で「もし入っていたらどうなったか」を計算する
 3. `outcomes.evaluation_mode = counterfactual` として保存する
+
+**buy 方向と sell 方向の両方を評価する。** 対象は先物（→ §6.1）でショートも正規の
+判断肢であるため、buy 方向だけを検証すると「本当は sell すべきだったのに見送った」
+ケースを機会損失として検出できず、見送りの精度が buy 側に偏る。
+
+そのため `no_action` の場合は **counterfactual の outcome を 2 件**（buy 想定・sell 想定）作る。
+`outcomes` に `hypothetical_action`（`buy` / `sell`）を持たせて区別する。
+`unique(signal_id)` は `unique(signal_id, hypothetical_action)` に緩める
+（`actual` の場合は `hypothetical_action` を NULL とし、1 件のみ）。
+
+判定は次のようになる:
+
+| buy 想定 | sell 想定 | 見送りの評価 |
+|---|---|---|
+| loss | loss | ✅ 正しい（どちらに入っても負けていた） |
+| win | loss | ❌ 機会損失（buy すべきだった） |
+| loss | win | ❌ 機会損失（sell すべきだった） |
+| win | win | 起こりえない（tp/sl が対称なら両建てで両方勝つことはない） |
 
 解釈は反転する:
 
@@ -411,15 +452,24 @@ vision.md §2 では、ニュース・経済イベント・規制情報なども
 | 速度 | 重要ニュースは数秒で織り込まれる。定期ジョブでは間に合わない |
 | コスト | 履歴付きの良質なAPIは高価。無料のものは過去アーカイブがなく学習に使えない |
 
-**追加の優先順位**（すべて `features` JSONB に追加するだけで済む）:
+**モデルへ投入する優先順位**:
 
 1. **OHLCV のみ** ← まずここでベースラインを確立する
-2. Funding Rate / Open Interest / Long-Short Ratio（Binance から無料・数値・履歴あり）
-3. Fear & Greed Index（無料・日次・履歴あり・最初から数値）
+2. Funding Rate / Open Interest / Long-Short Ratio（無料・数値・価格と独立）
+3. Fear & Greed Index（無料・日次。ただし算出根拠に価格由来の要素が含まれるため、
+   テクニカル指標と情報が一部重複する）
 4. ニュース系（費用対効果が最も低い）
 
 **ベースラインなしに情報を追加してはいけない。** 比較対象がなければ「効いたかどうか」を
 判定できず、vision の「データで判断する」が成立しなくなるため。
+
+⚠️ **投入の優先順位と、収集の優先順位は別**である。
+Open Interest / Long-Short Ratio は遡って取得できないため（→ §6.5）、
+モデルに投入するのが 2 番目であっても、**収集は最初から始める**必要がある。
+
+なお Funding / OI などは candles と同様に独立した時系列であり、
+`market_snapshots.features` に入れるだけでは済まず、**専用のテーブルが必要**になる。
+`features` は「判断時にその値がいくつだったか」を凍結する用途に留まる。
 
 ---
 
@@ -429,11 +479,42 @@ vision.md §2 では、ニュース・経済イベント・規制情報なども
 
 | 項目 | 値 |
 |---|---|
-| 市場 | 仮想通貨（無料・24時間365日・データの穴が少ない） |
+| 市場 | 仮想通貨 |
 | 取引所 | Binance |
-| 銘柄 | BTC/USDT（初期は1銘柄） |
+| 商品 | **無期限先物（Perpetual）** |
+| 銘柄 | BTCUSDT（初期は1銘柄） |
 | 保存する足 | **1h** |
 | 判断する足 | **4h**（1h から合成） |
+
+#### なぜ仮想通貨か
+
+- **24時間365日動く**ため、土日のギャップが存在しない。
+  FX や株では週末を挟むと窓が開き、stop_loss の価格で決済できず、
+  §4.5 の「バリア価格で決済される」という評価の前提が崩れる
+- 価格以外に **Funding Rate / Open Interest / Long-Short Ratio** が取れる。
+  これらは価格からは導出できない独立した情報で、FX には相当するものがほぼ無い
+- public API が無料で、過去データの一括アーカイブも公開されている
+
+税制面では日本の場合 FX（申告分離課税）の方が有利だが、現時点はアラートの検証段階であり、
+実運用に至った時点で改めて検討する。なおドメインモデルは資産クラス非依存のため、
+FX へ移す場合もデータ取得アダプタの差し替えで済む。
+
+#### なぜ Binance か
+
+- 取引量が世界最大で、価格の信頼性が高い
+- `data.binance.vision` で**過去データを一括ダウンロードできる**（他取引所には少ない）
+- public 市場データは API キー不要
+
+#### なぜ現物ではなく先物か
+
+- **Funding Rate / Open Interest は先物にしか存在しない**。現物を選ぶとこれらを全て失う
+- 現物では空売りができず、vision の `Buy / Sell / No Action` のうち Sell が成立しない
+- 値動きは現物とほぼ同一のため、分析結果は現物にも流用できる
+- 先物を選んでもレバレッジは必須ではない（1 倍で扱える）
+
+将来実際に売買する段階では、居住地の規制により**取引先が別の取引所になる可能性がある**
+（日本ではデリバティブのレバレッジ上限や、利用できる取引所の制限がある）。
+データ収集と売買執行は分離できるため、この設計には影響しない。
 
 ### 6.2 初期ロード
 
@@ -485,6 +566,84 @@ Rails では Solid Queue の recurring（`config/recurring.yml`）で定義す�
 | RSI(14) / ATR(14) | 14本 |
 
 → MA200 を使うなら **4h 足で 300本以上（＝1h 足で 1,200本以上）** を保持する。
+
+### 6.5 収集対象データ一覧
+
+判断基準は **「後から取り返せるか」**。遡って取得できないデータは、使う予定がなくても
+収集だけ先に始める価値がある。収集を止めている期間は、後から埋められない。
+
+#### 🔴 最優先 — 遡れないため今すぐ収集を開始する
+
+Binance の先物データ系エンドポイントは**直近30日程度しか返さない**。
+過ぎた分は有料アグリゲーター（Coinglass 等）から購入する以外に入手できない。
+
+| データ | エンドポイント | 遡及 | 意味 |
+|---|---|---|---|
+| Open Interest | `/futures/data/openInterestHist` | ⚠️ 約30日 | 建玉残高。相場の過熱度 |
+| Long/Short Ratio（全体） | `/futures/data/globalLongShortAccountRatio` | ⚠️ 約30日 | 全体のポジション偏り |
+| Top Trader L/S（口座） | `/futures/data/topLongShortAccountRatio` | ⚠️ 約30日 | 大口の偏り |
+| Top Trader L/S（建玉） | `/futures/data/topLongShortPositionRatio` | ⚠️ 約30日 | 大口の建玉ベース偏り |
+| Taker Buy/Sell Ratio | `/futures/data/takerlongshortRatio` | ⚠️ 約30日 | 成行の買い/売り比率 |
+| Liquidations | WebSocket `forceOrder` | ⚠️ 履歴なし | 強制決済。急変動の燃料 |
+
+※ 各エンドポイントの遡及期間は変更されうるため、実装時に最新仕様を確認すること。
+
+**Open Interest が価格と独立した情報である例:**
+
+```
+価格↑ + OI↑  → 新規の買いが入っている      → トレンドが強い
+価格↑ + OI↓  → 売り方の買い戻し（撤退）     → 上昇が終わりかけ
+```
+
+この2つは OHLCV 上ではどちらも同じ陽線であり、区別できない。
+
+#### 🟡 保存する — 遡及可能だが、保存しなければ使えない
+
+| データ | 取得元 | 遡及 | 頻度 |
+|---|---|---|---|
+| OHLCV + 拡張4カラム | `/fapi/v1/klines` | ✅ 2017年〜 | 1h |
+| Funding Rate | `/fapi/v1/fundingRate` | ✅ 契約開始〜 | 8時間 |
+| Mark / Index Price | `/fapi/v1/premiumIndex` | △ | ベーシス算出用 |
+| Fear & Greed Index | `api.alternative.me/fng/` | ✅ 2018年〜 | 日次 |
+
+#### 🟢 保存しない — OHLCV から計算できる
+
+RSI / MACD / 移動平均 / ボリンジャーバンド / ATR / ボラティリティ /
+ストキャスティクス / OBV / VWAP / ADX ほか、指標は全て該当（→ §5.1）。
+
+#### ⚪ 将来検討
+
+| データ | 取得元 | 備考 |
+|---|---|---|
+| オンチェーン（取引所入出金・アクティブアドレス等） | Glassnode / CryptoQuant | 有料傾向 |
+| マクロ（DXY / S&P500 / 金利） | yfinance 等 | 無料・履歴あり。**遡れるので急がない** |
+| ニュース・イベント | 各種ニュースAPI | 優先度最低（→ §5.10） |
+
+#### データ量の見積もり（1銘柄・年間）
+
+| データ | 頻度 | 行数/年 |
+|---|---|---|
+| candles (1h) | 毎時 | 8,760 |
+| Funding Rate | 8時間 | 1,095 |
+| Open Interest | 毎時 | 8,760 |
+| L/S Ratio × 3種 | 毎時 | 26,280 |
+| Fear & Greed | 日次 | 365 |
+| **合計** | | **約 45,000 行/年** |
+
+10年蓄積しても約45万行であり、PostgreSQL にとって負荷にならない。
+
+#### 溜めることと、モデルに入れることは別
+
+vision.md は「できるだけ多くの情報を AI へ渡す」方針を掲げているが、
+統計上の制約として、学習データ 17,000 本（4h・8年）に対して特徴量を数百個入れれば
+**ノイズを学習して過学習する**。適正はおよそ 20〜50 特徴量。
+
+両者は次のように切り分けることで両立する。
+
+```
+保存 … 最大限に溜める（溜めなければ後から選ぶことすらできない）
+投入 … 厳選する（特徴量重要度で絞り、追加は必ずベースラインと比較する）
+```
 
 ---
 
