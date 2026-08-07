@@ -4,13 +4,18 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
-# PR に対して Claude が自動レビューを行い、指摘とサマリを sticky comment に投稿する。
+# PR に対して Claude が自動レビューを行い、該当行にインラインコメントで指摘する。
 # ※ これはマージの必須ゲートではない（advisory）。落ちてもマージはブロックされない。
 permissions:
   contents: read
   pull-requests: write
   # claude-code-action は GitHub トークンを OIDC 経由で取得するため必須。
   id-token: write
+
+# 同一 PR で連続 push したときは古い実行をキャンセルし、最新差分だけをレビューする。
+concurrency:
+  group: ai-approve-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   evaluate-ai-review:
@@ -28,25 +33,50 @@ jobs:
       - name: Claude code review
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # sticky comment に集約し、push のたびに同じコメントを更新する。
-          use_sticky_comment: true
+          # Claude サブスク（Pro/Max）の OAuth トークンで認証する。
+          # ローカルで `claude setup-token` を実行して得たトークンを
+          # リポジトリの Secrets に CLAUDE_CODE_OAUTH_TOKEN として登録しておく。
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # PR の詳細・既存コメントをコンテキストに含め、進捗コメントを1つ維持する。
+          # これにより「既に指摘済みの内容」を把握して重複を避けられる。
+          track_progress: true
           prompt: |
-            あなたはこの Rails アプリのシニアレビュアーです。
-            この Pull Request の差分をレビューして、日本語で簡潔にフィードバックしてください。
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
 
-            観点:
+            あなたはこの Rails アプリのシニアコードレビュアーです。
+            この Pull Request をレビューし、GitHub 上にインラインレビューコメントで
+            指摘してください。日本語で簡潔に。
+
+            【重要度ラベル】各指摘の冒頭に必ず付ける:
+            - MUST: バグ・セキュリティ・データ破壊など、マージ前に直すべきもの
+            - SHOULD: 品質・可読性・設計上の改善提案（任意だが推奨）
+            - nit: 些細な好み
+
+            【出力方法】
+            - 具体的な指摘は mcp__github_inline_comment__create_inline_comment を
+              使って該当ファイル・該当行にインラインで付ける（confirmed: true）。
+            - 最後に総評をまとめる: MUST / SHOULD の件数と全体判定を1行で
+              「✅ Approve」「💬 Comment」「⚠️ Request changes」のいずれか。
+
+            【増分レビュー（最重要）】
+            - この PR には、過去のレビューで既に付いたコメントが存在する場合がある。
+              track_progress で渡される PR コンテキスト、または
+              `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments`
+              で既存のレビューコメントを必ず確認すること。
+            - 既に指摘済みの内容と同じ問題は、二度とコメントしない（重複厳禁）。
+            - 今回の差分で新たに生じた問題だけを新規コメントする。
+            - 前回指摘して既に修正された点は蒸し返さない。必要なら総評で
+              「前回の指摘 N 件は解決済み」と一言触れる程度にする。
+
+            【観点】
             - バグ・ロジックの誤り・エッジケースの考慮漏れ
             - セキュリティ（未検証の入力、権限、SQL/HTML インジェクション、機密情報の露出）
             - 外部 API 呼び出しの例外処理・タイムアウト・リトライ
             - Rails / Ruby の慣習からの逸脱、可読性、テストの不足
 
-            出力フォーマット:
-            1. 冒頭に総評と判定を1行で: 「✅ Approve」「💬 Comment」「⚠️ Request changes」のいずれか
-            2. 重要度順に指摘（該当ファイル・行に触れる）。指摘が無ければ「特に問題なし」と明記
-            3. 些細な好み（nitpick）は "nit:" を付けて区別する
-
             重要: これは助言であり、マージをブロックするものではありません。
             確信が持てない指摘は断定せず、質問の形で残してください。
           claude_args: |
-            --max-turns 15
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api:*)"
+            --max-turns 30
