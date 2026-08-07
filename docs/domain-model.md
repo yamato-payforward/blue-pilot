@@ -53,7 +53,7 @@ BluePilot の背骨となる繰り返しです。各ステップで必ずデー�
 erDiagram
     symbols ||--o{ candles : "価格履歴を持つ"
     symbols ||--o{ market_snapshots : "スナップショットを持つ"
-    market_snapshots ||--o| signals : "判断を生む"
+    market_snapshots ||--o{ signals : "判断を生む（Analyzer ごとに1件）"
     analyzer_versions ||--o{ signals : "が判断した"
     signals ||--o| outcomes : "の成績"
 
@@ -97,6 +97,7 @@ erDiagram
     outcomes {
         bigint id PK
         bigint signal_id FK
+        string evaluation_mode
         string result
         string exit_reason
         decimal exit_price
@@ -105,6 +106,7 @@ erDiagram
         float max_favorable_pct
         float max_adverse_pct
         float holding_hours
+        boolean ambiguous
     }
     analyzer_versions {
         bigint id PK
@@ -193,9 +195,17 @@ erDiagram
 | `reason` | text | **判断理由**（vision の必須要件） |
 | `expires_at` | datetime | 時間切れ期限（→ §5.5） |
 
-- `no_action` でも**必ずレコードを作る**。「見送ったが正しかったか」も評価対象
+制約: `unique(market_snapshot_id, analyzer_version_id)`
+
+- `no_action` でも**必ずレコードを作る**。「見送ったが正しかったか」も評価対象（評価方法は §5.8）
 - `market_snapshot_id` と `analyzer_version_id` を必ず持つ
   → 「**どの入力を見て、どの手法が、そう判断したか**」が後から完全に追跡できる
+- unique 制約を `analyzer_version_id` との複合にしている理由:
+  ジョブがリトライされても重複を作らない（冪等）一方で、**同じスナップショットを複数の
+  Analyzer が同時に判断できる**ようにするため（→ §7 の比較実験）。
+  `market_snapshot_id` 単独の unique にすると、比較実験ができなくなる
+- `no_action` の場合も `entry_price` と仮想の `take_profit` / `stop_loss` を記録する。
+  記録しないと「見送りが正しかったか」を後から計算できないため（→ §5.8）
 
 ---
 
@@ -203,6 +213,7 @@ erDiagram
 
 | カラム | 型 | 説明 |
 |---|---|---|
+| `evaluation_mode` | string | `actual`（buy/sell）/ `counterfactual`（no_action）→ §5.8 |
 | `result` | string | `win` / `loss` / `draw` |
 | `exit_reason` | string | `take_profit` / `stop_loss` / `timeout` |
 | `exit_price` / `exit_at` | decimal / datetime | 決済価格・時刻 |
@@ -210,6 +221,7 @@ erDiagram
 | `max_favorable_pct` | float | 最大含み益（MFE） |
 | `max_adverse_pct` | float | 最大含み損（MAE） |
 | `holding_hours` | float | 保有時間 |
+| `ambiguous` | boolean | 同一足内で tp/sl 両方に到達し、順序が判別できなかった（→ §5.9） |
 
 制約: `unique(signal_id)`（1シグナルにつき1成績）
 
@@ -336,6 +348,79 @@ vision の基本理念そのもの。
 
 「見送った」という判断も、正しかったか間違っていたかを評価できる。評価しなければ、AI は「何もしない」を選び続けることで成績を守れてしまう。
 
+### 5.8 No Action をどう評価するか
+
+`no_action` には実際の tp/sl が存在しないため、そのままでは §4.5 の評価軸に乗らない。
+そこで **反実仮想（counterfactual）** で評価する。
+
+1. `no_action` のシグナルにも、**仮に buy していたら**の `entry_price` / `take_profit` / `stop_loss` を記録しておく
+2. 評価時は、buy/sell と**まったく同じロジック**で「もし入っていたらどうなったか」を計算する
+3. `outcomes.evaluation_mode = counterfactual` として保存する
+
+解釈は反転する:
+
+| `evaluation_mode` | `result` | 意味 |
+|---|---|---|
+| `actual` | `win` | 実際に入って勝った → 判断は正しい |
+| `actual` | `loss` | 実際に入って負けた → 判断は誤り |
+| `counterfactual` | `loss` | 入っていたら負けていた → **見送りは正しい** |
+| `counterfactual` | `win` | 入っていたら勝てていた → **見送りは誤り（機会損失）** |
+
+この方式の利点:
+
+- 評価ロジックが1本で済む（buy/sell と no_action で分岐しない）
+- `outcomes` のスキーマが統一され、集計クエリが単純になる
+- 「見送りの精度」を勝率と同じ土俵で測れる
+
+なお `evaluation_mode` は成績集計時に**必ず分けて扱う**こと。混ぜると実際の損益が歪む。
+
+### 5.9 tp と sl の順序が判別できない場合
+
+保存する足（1h）より細かい値動きは記録されていないため、**同一足内で tp と sl の両方に
+到達したケースでは順序が判別できない**。
+
+```
+1h足: 高値が take_profit を超え、安値が stop_loss を割っている
+      → どちらが先に起きたか不明
+```
+
+**ルール: 判別できない場合は `loss` として扱い、`ambiguous = true` を立てる。**
+
+悲観的に倒す理由:
+
+- 楽観的に処理すると成績が実際より良く見え、**使えない戦略を採用してしまう**
+- vision の「利益よりもリスク管理を優先する」に沿う
+- `ambiguous` フラグを立てておけば、後から発生頻度を集計して影響を測れる
+
+発生頻度は tp/sl の幅に依存する。現在の設定（tp-sl 間が約 5×ATR ≒ 5〜7%）では
+1h 足で年に数回程度と見込まれるが、**将来 tp/sl を狭めると頻度が上がる**。
+`ambiguous` の比率が無視できなくなったら、より細かい足（15m 等）の保存を検討する。
+その際は Binance のアーカイブから再取得すればよく、作り直しは初期ロードジョブの再実行で済む。
+
+### 5.10 ファンダメンタル情報を現時点でスコープ外とする理由
+
+vision.md §2 では、ニュース・経済イベント・規制情報などもAIへ渡す方針が示されている。
+これは最終的な目標として維持するが、**初期スコープには含めない**。
+
+理由:
+
+| 課題 | 内容 |
+|---|---|
+| サンプル数 | 主要ニュースは8年でも数十件。統計的な学習が成立せず過学習する |
+| point-in-time | ニュースAPIは記事を後から追加・修正することがあり、「当時知り得なかった情報」で学習してしまう危険がある。OHLCV にはこの問題がない |
+| 速度 | 重要ニュースは数秒で織り込まれる。定期ジョブでは間に合わない |
+| コスト | 履歴付きの良質なAPIは高価。無料のものは過去アーカイブがなく学習に使えない |
+
+**追加の優先順位**（すべて `features` JSONB に追加するだけで済む）:
+
+1. **OHLCV のみ** ← まずここでベースラインを確立する
+2. Funding Rate / Open Interest / Long-Short Ratio（Binance から無料・数値・履歴あり）
+3. Fear & Greed Index（無料・日次・履歴あり・最初から数値）
+4. ニュース系（費用対効果が最も低い）
+
+**ベースラインなしに情報を追加してはいけない。** 比較対象がなければ「効いたかどうか」を
+判定できず、vision の「データで判断する」が成立しなくなるため。
+
 ---
 
 ## 6. データ取得仕様
@@ -367,10 +452,24 @@ https://data.binance.vision/    月次・日次の CSV アーカイブ
 | ジョブ | 頻度 | 内容 |
 |---|---|---|
 | **取得** | 毎時 05分 | 直前の確定 1h 足を取得・保存 |
-| **分析** | 00,04,08,12,16,20時 の 05分 | 4h 足を合成 → 指標計算 → AI 判断 → signal 保存 |
-| **評価** | 毎時 10分 | 未決着 signal を 1h 足で判定、決着したら outcome 保存 |
+| **分析** | 00,04,08,12,16,20時 の **15分** | 4h 足を合成 → 指標計算 → AI 判断 → signal 保存 |
+| **評価** | 毎時 **20分** | 未決着 signal を 1h 足で判定、決着したら outcome 保存 |
 
 すべて **UTC** 基準。4h 足の確定時刻は `00:00 / 04:00 / 08:00 / 12:00 / 16:00 / 20:00`。
+
+実行時刻をずらしている理由は**ジョブ間のレース条件を避けるため**。分析ジョブが合成する
+4h 足の最後の1本は、同じ時刻に走る取得ジョブが保存しようとしているものと同一になる。
+同時刻に走らせると、**1本欠けた状態で 4h 足を合成してしまう**。
+
+```
+05分  取得   … 04:00〜05:00 の 1h 足を保存
+15分  分析   … 00:00〜04:00 の 4h 足を合成（取得完了から10分の余裕）
+20分  評価   … 保存済みの 1h 足で未決着 signal を判定
+```
+
+時刻をずらすだけでは不十分なので（取得が遅延・失敗する可能性がある）、
+**分析ジョブは開始時に必要な 1h 足が揃っているかを検証し、欠けていれば実行せずリトライする**。
+時刻の分離は一次防御、事前検証が最終防御。
 
 Rails では Solid Queue の recurring（`config/recurring.yml`）で定義する。
 
