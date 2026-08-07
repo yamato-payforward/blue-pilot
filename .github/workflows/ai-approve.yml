@@ -1,0 +1,50 @@
+name: AI approve
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# PR に対して Claude が自動レビューを行い、指摘とサマリを sticky comment に投稿する。
+# ※ これはマージの必須ゲートではない（advisory）。落ちてもマージはブロックされない。
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  evaluate-ai-review:
+    runs-on: ubuntu-latest
+    # fork からの PR や dependabot ではシークレットが渡らないためスキップする。
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Claude code review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # sticky comment に集約し、push のたびに同じコメントを更新する。
+          use_sticky_comment: true
+          prompt: |
+            あなたはこの Rails アプリのシニアレビュアーです。
+            この Pull Request の差分をレビューして、日本語で簡潔にフィードバックしてください。
+
+            観点:
+            - バグ・ロジックの誤り・エッジケースの考慮漏れ
+            - セキュリティ（未検証の入力、権限、SQL/HTML インジェクション、機密情報の露出）
+            - 外部 API 呼び出しの例外処理・タイムアウト・リトライ
+            - Rails / Ruby の慣習からの逸脱、可読性、テストの不足
+
+            出力フォーマット:
+            1. 冒頭に総評と判定を1行で: 「✅ Approve」「💬 Comment」「⚠️ Request changes」のいずれか
+            2. 重要度順に指摘（該当ファイル・行に触れる）。指摘が無ければ「特に問題なし」と明記
+            3. 些細な好み（nitpick）は "nit:" を付けて区別する
+
+            重要: これは助言であり、マージをブロックするものではありません。
+            確信が持てない指摘は断定せず、質問の形で残してください。
+          claude_args: |
+            --max-turns 15
